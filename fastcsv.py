@@ -139,13 +139,13 @@ def find_row(filename, key):
     for value in key:
         if not isinstance(value, unicode):
             raise Exception('Key contains non-unicode values: %r'%(key,))
-    end_pos, header_rows = lex(filename, rows=1)
+    header_end_pos, header_rows = lex(filename, rows=1)
     if not len(header_rows)>0:
         raise Exception('No header in CSV')
     headers = header_rows[0]
     if len(headers) < len(key):
         raise Exception('Key being asked for is longer than the number of columns')
-    end_pos, rows = lex(filename, pos=end_pos+1, rows=1)
+    end_pos, rows = lex(filename, pos=header_end_pos+1, rows=1)
     if not len(rows)>0:
         # No rows in the CSV file
         raise KeyError('No rows for key %r'%(key, ))
@@ -154,16 +154,18 @@ def find_row(filename, key):
     first_block_row_key = [value.decode('utf8') for value in rows[0][:len(key)]]
     debug("First block key: %r"%(first_block_row_key,))
     if key == first_block_row_key:
-        return return_rows_from(filename, key, end_pos, [value.decode('utf8') for value in rows[0]])
+        return return_rows_from(filename, key, end_pos+1, [[value.decode('utf8') for value in rows[0]]])
     block_size, a, b, c = parse_filename(filename)
     last_block = calculate_last_block(filename, block_size)
+    if last_block <= first_block:
+        return iterate_until_finding(filename, key, header_end_pos+1)
     end_pos, rows = lex(filename, pos=last_block*block_size, rows=1)
     if len(rows[0]) != len(headers):
         debug('The number of columns in the last block\'s first row does not match the number of headers')
     last_block_row_key = [value.decode('utf8') for value in rows[0][:len(key)]]
     debug("Last block key: %r"%(last_block_row_key,))
     if key == last_block_row_key:
-        return return_rows_from(filename, key, end_pos, [value.decode('utf8') for value in rows[0]])
+        return return_rows_from(filename, key, end_pos+1, [[value.decode('utf8') for value in rows[0]]])
     # If it is in the last block:
     if key > last_block_row_key:
         result = return_rows_from(filename, key, end_pos+1)
@@ -176,26 +178,7 @@ def find_row(filename, key):
         if last_block - first_block <= 1:
             # Just search the blocks
             debug("Searching the blocks directly")
-            rowsi = []
-            def row_callback(row, end_pos):
-                if end_pos > (last_block+1)*block_size:
-                    debug("Reached %s, past the end of the block %s at %s"%(end_pos, last_block, (last_block+1)*block_size))
-                    return False
-                pyrow = [x.decode('utf8') for x in row]
-                if pyrow[:len(key)] == key:
-                    rowsi.append(pyrow)
-                    debug("Found a row")
-                    return True
-                elif rowsi:
-                    # We've stopped finding our key
-                    debug("Finished finding key")
-                    return False
-                # Not one we want yet, keep looking
-                return True
-            lex(filename, first_block*block_size, row_callback, rows=None)
-            if not rowsi:
-                raise KeyError('No rows for key %r'%(key, ))
-            return rowsi
+            return iterate_until_finding(filename, key, first_block*block_size, (last_block+1)*block_size)
         else:
             next_block = int((last_block + first_block)/2)
             debug("Next block is %s"%(next_block))
@@ -209,13 +192,40 @@ def find_row(filename, key):
                 last_block = next_block
     return rows[0], header_length
 
-def return_rows_from(filename, key, pos, start_rows=None):
-    rows = start_rows or []
+def iterate_until_finding(filename, key, start_pos, max_pos=None):
+    rows = []
     def row_callback(row, end_pos):
-        rows.append([x.decode('utf8') for x in row])
-        if rows[-1][:len(key)] != key:
+        if max_pos is not None and end_pos > max_pos:
+            debug("Reached %s, past the maximum of %s"%(end_pos, max_pos))
             return False
+        pyrow = [x.decode('utf8') for x in row]
+        if pyrow[:len(key)] == key:
+            rows.append(pyrow)
+            debug("Found a row")
+            return True
+        elif rows:
+            # We've stopped finding our key
+            debug("Finished finding key")
+            return False
+        # Not one we want yet, keep looking
         return True
+    lex(filename, start_pos, row_callback, rows=None)
+    if not rows:
+        raise KeyError('No rows for key %r'%(key, ))
+    return rows
+
+def return_rows_from(filename, key, pos, start_rows=None):
+    if start_rows:
+        rows = start_rows[:]
+    else:
+        rows = []
+    def row_callback(row, end_pos):
+        new_row = [x.decode('utf8') for x in row[:len(key)]]
+        if new_row != key:
+            return False
+        else:
+            rows.append(new_row+[x.decode('utf8') for x in row[len(key):]])
+            return True
     lex(filename, pos, row_callback, rows=None)
     return rows
 
@@ -291,10 +301,11 @@ try:
                 length = 0
                 for item in rowi:
                     length += len(item)
-                row_callback(rowi, pos+length)
+                result = row_callback(rowi, pos+length)
                 rowsi.append(rowi[:])
                 while rowi:
                     rowi.pop()
+                return result
         else:
             def callback_row_wrapper():
                 #print 4,
@@ -304,6 +315,7 @@ try:
                 rowsi.append(rowi[:])
                 while rowi:
                     rowi.pop()
+                return True
         callback_row = make_callback_row(callback_row_wrapper)
         if rows is None:
             rows = -1
@@ -335,6 +347,8 @@ except:
                         row.append(value)
                         if row_callback:
                             keep_going = row_callback(row, final-1)
+                            if keep_going not in [True, False]:
+                                raise Exception("Row callback failed to return True or False")
                         else:
                             row_data.append(row)
                     return final-1, row_data
@@ -362,7 +376,8 @@ except:
                             value += char 
                     elif state == ROW_START:
                         if char == '\n':
-                            raise Exception(r'Expected \r\n at position %s, not \n'%(final-1,))
+                            # XXX raise Exception(r'Expected \r\n at position %s, not \n'%(final-1,))
+                            warn(r'Expected \r\n at position %s, not \n'%(final-1,))
                         elif char == '\r':
                             state = NON_VALUE_CR
                         elif char == ',':
@@ -400,6 +415,8 @@ except:
                             row.append(value)
                             if row_callback:
                                 keep_going = row_callback(row, final-1)
+                                if keep_going not in [True, False]:
+                                    raise Exception("Row callback failed to return True or False")
                             else:
                                 row_data.append(row)
                             row_callback_count += 1
@@ -429,6 +446,8 @@ except:
                             row.append(value)
                             if row_callback:
                                 keep_going = row_callback(row, final-1)
+                                if keep_going not in [True, False]:
+                                    raise Exception("Row callback failed to return True or False")
                             else:
                                 row_data.append(row)
                             row_callback_count += 1
@@ -459,6 +478,8 @@ except:
                             row.append(value)
                             if row_callback:
                                 keep_going = row_callback(row, final-1)
+                                if keep_going not in [True, False]:
+                                    raise Exception("Row callback failed to return True or False")
                             else:
                                 row_data.append(row)
                             row_callback_count += 1
@@ -477,6 +498,8 @@ except:
                             row.append(value)
                             if row_callback:
                                 keep_going = row_callback(row, final-1)
+                                if keep_going not in [True, False]:
+                                    raise Exception("Row callback failed to return True or False")
                             else:
                                 row_data.append(row)
                             row_callback_count += 1
@@ -507,6 +530,8 @@ except:
                             row.append(value)
                             if row_callback:
                                 keep_going = row_callback(row, final-1)
+                                if keep_going not in [True, False]:
+                                    raise Exception("Row callback failed to return True or False")
                             else:
                                 row_data.append(row)
                             row_callback_count += 1
